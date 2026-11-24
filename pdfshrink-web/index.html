@@ -52,7 +52,7 @@
     <label>JPEG quality (optional, 1-100)
       <input id="quality" type="number" min="1" max="100" placeholder="e.g. 60">
     </label>
-    <label class="row"><input id="scan" type="checkbox"> Scanned document mode</label>
+    <label class="row" title="Rasterizes pages, then JPEG-encodes them. For image-only scans; text will not stay selectable."><input id="scan" type="checkbox"> Scanned document mode</label>
     <label class="row"><input id="gray" type="checkbox"> Convert to grayscale</label>
   </div>
 
@@ -72,27 +72,30 @@ let worker = null, busy = false;
 
 const human = (n) => { const u=['B','KB','MB','GB']; let i=0; while (n>=1024 && i<3) { n/=1024; i++; } return n.toFixed(i?1:0)+' '+u[i]; };
 
-// Scanned PDFs hold already-compressed JPEGs, which Ghostscript passes through
-// untouched. Scan mode (or setting a quality) forces a re-encode so size actually drops.
+// Scanners often store pages as palette (indexed) images, which Ghostscript will not
+// re-encode as JPEG. Scan mode therefore rasterizes every page first (pass 1), then
+// JPEG-encodes the result (pass 2). Text in such PDFs is not selectable afterwards.
 function buildArgs() {
-  const scan = $('scan').checked;
+  const scan = $('scan').checked, gray = $('gray').checked;
   const dpi = parseInt($('dpi').value, 10) || (scan ? 150 : 0);
-  const q = parseInt($('quality').value, 10) || (scan ? 60 : 0);
-  const a = ['-sDEVICE=pdfwrite','-dCompatibilityLevel=1.5','-dNOPAUSE','-dBATCH','-dQUIET','-dSAFER',
+  const q = parseInt($('quality').value, 10) || (scan ? 70 : 0);
+  const base = ['-dNOPAUSE','-dBATCH','-dQUIET','-dSAFER'];
+  const a = ['-sDEVICE=pdfwrite','-dCompatibilityLevel=1.5', ...base,
     '-dPDFSETTINGS=' + $('preset').value, '-dDetectDuplicateImages=true', '-dCompressFonts=true', '-dSubsetFonts=true'];
-  if (dpi) {
+  if (dpi && !scan) {
     for (const k of ['Color','Gray']) a.push(`-dDownsample${k}Images=true`, `-d${k}ImageResolution=${dpi}`, `-d${k}ImageDownsampleType=/Bicubic`, `-d${k}ImageDownsampleThreshold=1.0`);
     a.push('-dDownsampleMonoImages=true', `-dMonoImageResolution=${Math.max(dpi*2,300)}`);
   }
   if (scan || q) a.push('-dPassThroughJPEGImages=false','-dAutoFilterColorImages=false','-dColorImageFilter=/DCTEncode','-dAutoFilterGrayImages=false','-dGrayImageFilter=/DCTEncode');
-  if ($('gray').checked) a.push('-sColorConversionStrategy=Gray','-dProcessColorModel=/DeviceGray');
+  if (gray && !scan) a.push('-sColorConversionStrategy=Gray','-dProcessColorModel=/DeviceGray');
   let tail = ['input.pdf'];
   if (q) {
     const qf = Math.max(0.05, (100 - q) / 50).toFixed(2);
     const d = `<< /QFactor ${qf} /Blend 1 /HSamples [2 1 1 2] /VSamples [2 1 1 2] >>`;
     tail = ['-c', `<< /ColorImageDict ${d} /GrayImageDict ${d} >> setdistillerparams`, '-f', 'input.pdf'];
   }
-  return { args: a, tail };
+  const pre = scan ? [`-sDEVICE=${gray ? 'pdfimage8' : 'pdfimage24'}`, `-r${dpi}`, ...base] : null;
+  return { args: a, tail, pre };
 }
 
 function addFiles(files) {
@@ -131,8 +134,8 @@ function run(item) {
     };
     w.onerror = (e) => { w.terminate(); meta.className = 'meta err'; meta.textContent = 'Worker error: ' + (e.message || 'failed to load'); resolve(); };
     const data = await item.file.arrayBuffer();
-    const { args, tail } = buildArgs();
-    w.postMessage({ id: item.id, data, args, tail }, [data]);
+    const { args, tail, pre } = buildArgs();
+    w.postMessage({ id: item.id, data, args, tail, pre }, [data]);
   });
 }
 
