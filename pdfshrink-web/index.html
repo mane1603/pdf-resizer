@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pdfshrink: compress PDFs in your browser</title>
+<style>
+  :root { --bg:#fafaf9; --fg:#1c1917; --mut:#78716c; --card:#fff; --bd:#e7e5e4; --ac:#2563eb; --ok:#15803d; --err:#b91c1c; color-scheme: light; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#0c0a09; --fg:#f5f5f4; --mut:#a8a29e; --card:#1c1917; --bd:#292524; --ac:#60a5fa; --ok:#4ade80; --err:#f87171; color-scheme: dark; } }
+  * { box-sizing:border-box }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  main { max-width:720px; margin:0 auto; padding:32px 16px 64px; }
+  h1 { font-size:1.6rem; margin:0 0 4px } p.sub { color:var(--mut); margin:0 0 24px }
+  .card { background:var(--card); border:1px solid var(--bd); border-radius:12px; padding:16px; margin-bottom:16px }
+  #drop { border:2px dashed var(--bd); text-align:center; padding:36px 16px; cursor:pointer; border-radius:12px; color:var(--mut) }
+  #drop.over { border-color:var(--ac); color:var(--fg) }
+  .opts { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:12px }
+  label { display:flex; flex-direction:column; gap:4px; font-size:.85rem; color:var(--mut) }
+  label.row { flex-direction:row; align-items:center; gap:8px; align-self:end; padding-bottom:8px }
+  select,input[type=number] { font:inherit; padding:8px; border-radius:8px; border:1px solid var(--bd); background:var(--bg); color:var(--fg) }
+  button { font:inherit; padding:8px 14px; border-radius:8px; border:0; background:var(--ac); color:#fff; cursor:pointer }
+  button:disabled { opacity:.5; cursor:default }
+  .file { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:10px 0; border-top:1px solid var(--bd) }
+  .file:first-child { border-top:0 }
+  .name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:500 }
+  .meta { font-size:.85rem; color:var(--mut) } .ok { color:var(--ok) } .err { color:var(--err); white-space:pre-wrap }
+  a.dl { color:var(--ac); text-decoration:none; font-weight:500; white-space:nowrap }
+  footer { color:var(--mut); font-size:.8rem; margin-top:24px }
+</style>
+</head>
+<body>
+<main>
+  <h1>pdfshrink</h1>
+  <p class="sub">Compress PDFs with real Ghostscript, running in your browser. Files never leave your device.</p>
+
+  <div class="card">
+    <div id="drop">Drop PDFs here or click to choose<input id="pick" type="file" accept="application/pdf" multiple hidden></div>
+  </div>
+
+  <div class="card opts">
+    <label>Quality preset
+      <select id="preset">
+        <option value="/screen">Screen (smallest, ~72 dpi)</option>
+        <option value="/ebook" selected>Ebook (balanced, ~150 dpi)</option>
+        <option value="/printer">Printer (~300 dpi)</option>
+        <option value="/prepress">Prepress (largest, best color)</option>
+      </select>
+    </label>
+    <label>Image DPI override (optional)
+      <input id="dpi" type="number" min="30" max="600" placeholder="e.g. 110">
+    </label>
+    <label>JPEG quality (optional, 1-100)
+      <input id="quality" type="number" min="1" max="100" placeholder="e.g. 60">
+    </label>
+    <label class="row"><input id="scan" type="checkbox"> Scanned document mode</label>
+    <label class="row"><input id="gray" type="checkbox"> Convert to grayscale</label>
+  </div>
+
+  <div class="card" id="list" hidden></div>
+  <button id="go" disabled>Compress</button>
+
+  <footer>
+    Powered by <a href="https://ghostscript.com">Ghostscript</a> compiled to WebAssembly (<a href="https://github.com/jsscheller/ghostscript-wasm">ghostscript-wasm</a>), licensed AGPL-3.0.
+    Source for this site is in the repository it is served from.
+  </footer>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const items = []; // {id, file, row, status}
+let worker = null, busy = false;
+
+const human = (n) => { const u=['B','KB','MB','GB']; let i=0; while (n>=1024 && i<3) { n/=1024; i++; } return n.toFixed(i?1:0)+' '+u[i]; };
+
+// Scanned PDFs hold already-compressed JPEGs, which Ghostscript passes through
+// untouched. Scan mode (or setting a quality) forces a re-encode so size actually drops.
+function buildArgs() {
+  const scan = $('scan').checked;
+  const dpi = parseInt($('dpi').value, 10) || (scan ? 150 : 0);
+  const q = parseInt($('quality').value, 10) || (scan ? 60 : 0);
+  const a = ['-sDEVICE=pdfwrite','-dCompatibilityLevel=1.5','-dNOPAUSE','-dBATCH','-dQUIET','-dSAFER',
+    '-dPDFSETTINGS=' + $('preset').value, '-dDetectDuplicateImages=true', '-dCompressFonts=true', '-dSubsetFonts=true'];
+  if (dpi) {
+    for (const k of ['Color','Gray']) a.push(`-dDownsample${k}Images=true`, `-d${k}ImageResolution=${dpi}`, `-d${k}ImageDownsampleType=/Bicubic`, `-d${k}ImageDownsampleThreshold=1.0`);
+    a.push('-dDownsampleMonoImages=true', `-dMonoImageResolution=${Math.max(dpi*2,300)}`);
+  }
+  if (scan || q) a.push('-dPassThroughJPEGImages=false','-dAutoFilterColorImages=false','-dColorImageFilter=/DCTEncode','-dAutoFilterGrayImages=false','-dGrayImageFilter=/DCTEncode');
+  if ($('gray').checked) a.push('-sColorConversionStrategy=Gray','-dProcessColorModel=/DeviceGray');
+  let tail = ['input.pdf'];
+  if (q) {
+    const qf = Math.max(0.05, (100 - q) / 50).toFixed(2);
+    const d = `<< /QFactor ${qf} /Blend 1 /HSamples [2 1 1 2] /VSamples [2 1 1 2] >>`;
+    tail = ['-c', `<< /ColorImageDict ${d} /GrayImageDict ${d} >> setdistillerparams`, '-f', 'input.pdf'];
+  }
+  return { args: a, tail };
+}
+
+function addFiles(files) {
+  for (const f of files) {
+    if (!/\.pdf$/i.test(f.name) && f.type !== 'application/pdf') continue;
+    const row = document.createElement('div'); row.className = 'file';
+    row.innerHTML = '<div style="min-width:0"><div class="name"></div><div class="meta"></div></div><div class="act"></div>';
+    row.querySelector('.name').textContent = f.name;
+    row.querySelector('.meta').textContent = human(f.size) + ' · ready';
+    $('list').appendChild(row);
+    items.push({ id: items.length, file: f, row, done: false });
+  }
+  $('list').hidden = !items.length;
+  $('go').disabled = !items.some(i => !i.done) || busy;
+}
+
+function run(item) {
+  return new Promise(async (resolve) => {
+    const meta = item.row.querySelector('.meta'), act = item.row.querySelector('.act');
+    meta.className = 'meta'; meta.textContent = human(item.file.size) + ' · compressing…'; act.textContent = '';
+    const w = new Worker('worker.js');
+    w.onmessage = (e) => {
+      const m = e.data; w.terminate();
+      if (!m.ok) { meta.className = 'meta err'; meta.textContent = 'Failed: ' + m.error; return resolve(); }
+      const before = item.file.size, after = m.out.length;
+      if (after >= before) {
+        meta.className = 'meta'; meta.textContent = `${human(before)} · result not smaller (${human(after)}), original kept. Try Scanned document mode or a lower JPEG quality.`;
+      } else {
+        const pct = Math.round((1 - after/before) * 100);
+        meta.className = 'meta ok'; meta.textContent = `${human(before)} → ${human(after)} (${pct}% smaller)`;
+        const url = URL.createObjectURL(new Blob([m.out], { type: 'application/pdf' }));
+        const a = document.createElement('a'); a.className = 'dl'; a.textContent = 'Download';
+        a.href = url; a.download = item.file.name.replace(/\.pdf$/i, '') + '.min.pdf'; act.appendChild(a);
+      }
+      item.done = true; resolve();
+    };
+    w.onerror = (e) => { w.terminate(); meta.className = 'meta err'; meta.textContent = 'Worker error: ' + (e.message || 'failed to load'); resolve(); };
+    const data = await item.file.arrayBuffer();
+    const { args, tail } = buildArgs();
+    w.postMessage({ id: item.id, data, args, tail }, [data]);
+  });
+}
+
+$('go').onclick = async () => {
+  busy = true; $('go').disabled = true;
+  for (const it of items) if (!it.done) await run(it);
+  busy = false; $('go').disabled = !items.some(i => !i.done);
+};
+
+const drop = $('drop');
+drop.onclick = () => $('pick').click();
+$('pick').onchange = (e) => { addFiles(e.target.files); e.target.value = ''; };
+['dragenter','dragover'].forEach(t => drop.addEventListener(t, e => { e.preventDefault(); drop.classList.add('over'); }));
+['dragleave','drop'].forEach(t => drop.addEventListener(t, e => { e.preventDefault(); drop.classList.remove('over'); }));
+drop.addEventListener('drop', e => addFiles(e.dataTransfer.files));
+</script>
+</body>
+</html>
